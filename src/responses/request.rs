@@ -8,14 +8,26 @@ use crate::schema::canonical_hash;
 use serde_json::Value;
 use uuid::Uuid;
 
-pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result<ResponsesRequest> {
-    convert_request_with_relocation(
+/// Same as the chat converter's relocation switch, with an already-resolved
+/// upstream model.
+///
+/// The messages route resolves the model once (to pick the wire API and the
+/// upstream client); passing the result here keeps that single resolution —
+/// and its `/health` counters — authoritative.
+pub fn convert_request_with_model(
+    req: &MessagesRequest,
+    config: &Config,
+    model: &str,
+) -> anyhow::Result<ResponsesRequest> {
+    convert_request_with_relocation_and_model(
         req,
         config,
         std::env::var("CODEMERMAFROST_RELOCATE").is_ok(),
+        model,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn convert_request_with_relocation(
     req: &MessagesRequest,
     config: &Config,
@@ -23,6 +35,26 @@ pub(crate) fn convert_request_with_relocation(
 ) -> anyhow::Result<ResponsesRequest> {
     let model =
         crate::anthropic::converter::map_model_to_upstream_for_responses(&req.model, config);
+    convert_request_with_relocation_and_model(req, config, relocate, &model)
+}
+
+/// Test-only: resolve the model from the request and honor the process env
+/// `CODEMERMAFROST_RELOCATE` flag (the pre-refactor public entry point).
+#[cfg(test)]
+fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result<ResponsesRequest> {
+    convert_request_with_relocation(
+        req,
+        config,
+        std::env::var("CODEMERMAFROST_RELOCATE").is_ok(),
+    )
+}
+
+pub(crate) fn convert_request_with_relocation_and_model(
+    req: &MessagesRequest,
+    config: &Config,
+    relocate: bool,
+    model: &str,
+) -> anyhow::Result<ResponsesRequest> {
     if req.max_tokens < 16 {
         anyhow::bail!("max_tokens must be at least 16 for Responses API");
     }
@@ -60,7 +92,7 @@ pub(crate) fn convert_request_with_relocation(
         converted
     });
     let tool_choice = req.tool_choice.as_ref().map(convert_tool_choice);
-    let reasoning = reasoning_config(req, config, &model);
+    let reasoning = reasoning_config(req, config, model);
     let static_prefix_hash = canonical_hash(&serde_json::json!({
         "model": model,
         "instructions": instructions,
@@ -96,10 +128,16 @@ pub(crate) fn convert_request_with_relocation(
         synthetic_tail_present = !volatile_texts.is_empty(),
         input_item_types = ?input_item_types,
         model = %model,
+        // Effort observability: what the client asked for (output_config),
+        // what its thinking mode implies, and what actually goes upstream.
+        inbound_effort = ?crate::anthropic::converter::inbound_effort(req).as_deref(),
+        thinking_budget = ?req.thinking.as_ref().and_then(|t| t.budget_tokens()),
+        reasoning_effort = ?reasoning.as_ref().map(|r| r.effort.as_str()),
+        reasoning_summary = ?reasoning.as_ref().and_then(|r| r.summary.as_deref()),
         "Responses request built"
     );
     Ok(ResponsesRequest {
-        model,
+        model: model.to_string(),
         request_id: Uuid::new_v4().simple().to_string(),
         instructions,
         input,
@@ -139,33 +177,42 @@ fn reasoning_config(
     config: &Config,
     model: &str,
 ) -> Option<ReasoningConfig> {
-    let enabled = req
-        .thinking
-        .as_ref()
-        .is_some_and(|thinking| thinking.is_enabled());
+    let thinking = req.thinking.as_ref();
     let supported = config
         .model_profile(model)
         .is_some_and(|profile| profile.reasoning_enabled);
-    // Effort precedence mirrors the Chat path: client-declared
-    // output_config.effort resolved against the provider's supported tiers;
-    // legacy fallback stays effort_map["max"].
+    if !supported {
+        return None;
+    }
+    // No thinking block at all: keep the legacy wire shape (no `reasoning`).
+    let thinking = thinking?;
     let provider = config
         .model_profile(model)
         .and_then(|profile| config.provider_config(&profile.provider));
-    let effort = match provider.as_ref().map(|prov| {
-        crate::reasoning::apply_effort::resolve_effort(
-            crate::anthropic::converter::inbound_effort(req)
-                .as_deref()
-                .unwrap_or("max"),
-            prov,
-        )
-    }) {
-        Some(resolved) => resolved,
-        None => "max".to_string(),
-    };
-    let summary = config
-        .model_profile(model)
-        .and_then(|profile| config.provider_config(&profile.provider))
+
+    if !thinking.is_enabled() {
+        // Explicitly disabled. GPT-style upstreams default to `medium` when the
+        // `reasoning` object is absent, so omitting it silently re-enables
+        // reasoning; pin the provider's lowest supported effort instead. No
+        // summary means the client sees no thinking blocks.
+        let effort = provider
+            .map(|prov| crate::reasoning::apply_effort::resolve_effort("none", prov))
+            .unwrap_or_else(|| "low".to_string());
+        return Some(ReasoningConfig {
+            effort,
+            summary: None,
+        });
+    }
+
+    // Effort precedence: client-declared output_config.effort > thinking-budget
+    // tier (Claude Code `/think` levels) > legacy fallback `max`.
+    let intent = crate::anthropic::converter::inbound_effort(req)
+        .or_else(|| crate::reasoning::apply_effort::effort_from_thinking(req).map(str::to_string))
+        .unwrap_or_else(|| "max".to_string());
+    let effort = provider
+        .map(|prov| crate::reasoning::apply_effort::resolve_effort(&intent, prov))
+        .unwrap_or_else(|| "max".to_string());
+    let summary = provider
         .and_then(|provider| provider.responses_reasoning_summary.as_deref())
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "auto".to_string());
@@ -174,7 +221,7 @@ fn reasoning_config(
         "detailed" => Some("detailed".to_string()),
         _ => Some("auto".to_string()),
     };
-    (enabled && supported).then_some(ReasoningConfig { effort, summary })
+    Some(ReasoningConfig { effort, summary })
 }
 
 fn system_text(system: Option<&SystemPrompt>) -> Option<String> {
@@ -240,6 +287,15 @@ fn append_content_value(
                             input.push(serde_json::json!({"role": role, "content": std::mem::take(&mut content_items)}));
                         }
                         input.push(serde_json::json!({"type":"function_call_output", "call_id": tool_use_id, "output": tool_result_text(result)}));
+                        // function_call_output carries text only; tool-result
+                        // images ride on a follow-up user message.
+                        if let crate::anthropic::types::ToolResultContent::Blocks(blocks) = result {
+                            for block in blocks {
+                                if let crate::anthropic::types::ToolResultContentBlock::Image { source } = block {
+                                    content_items.push(serde_json::json!({"type":"input_image", "image_url": format!("data:{};base64,{}", source.media_type, source.data)}));
+                                }
+                            }
+                        }
                     }
                     ContentBlock::Thinking { .. }
                     | ContentBlock::RedactedThinking { .. }
@@ -552,6 +608,140 @@ mod tests {
         assert_eq!(
             canonical_hash(&serde_json::json!({"b": 2, "a": 1})),
             canonical_hash(&serde_json::json!({"a": 1, "b": 2}))
+        );
+    }
+
+    /// GPT-family config with the full, gateway-accepted effort set.
+    /// `none` is deliberately absent: some gateway backends reject it (400).
+    fn gpt_effort_config() -> crate::config::Config {
+        use crate::config::{Config, ModelProfile, ProviderConfig, WireApi};
+        use std::collections::HashMap;
+
+        let mut effort_map = HashMap::new();
+        for level in ["low", "medium", "high", "xhigh", "max"] {
+            effort_map.insert(level.to_string(), level.to_string());
+        }
+        let mut providers = HashMap::new();
+        providers.insert(
+            "gpt".to_string(),
+            ProviderConfig {
+                reasoning_field: String::new(),
+                reasoning_field_alt: Vec::new(),
+                thinking_param: None,
+                thinking_type_enabled: None,
+                thinking_type_disabled: None,
+                disable_thinking: false,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map,
+                responses_reasoning_summary: None,
+                cache_policy: None,
+            },
+        );
+        let mut profile_by_name = HashMap::new();
+        profile_by_name.insert("gpt-6.1-sol".to_string(), 0);
+        Config {
+            listen_addr: String::new(),
+            eswitch_url: String::new(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
+            api_key: String::new(),
+            log_level: String::new(),
+            model_mapping: HashMap::new(),
+            default_model: "gpt-6.1-sol".to_string(),
+            model_profiles: vec![ModelProfile {
+                name: "gpt-6.1-sol".to_string(),
+                provider: "gpt".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: false,
+                toolcall_requires_reasoning: false,
+                aliases: Vec::new(),
+                wire_api: WireApi::Responses,
+            }],
+            providers,
+            profile_by_name,
+        }
+    }
+
+    fn reasoning_for(thinking: Value, output_config: Option<Value>) -> Option<ReasoningConfig> {
+        let config = gpt_effort_config();
+        let mut payload = serde_json::json!({
+            "model": "gpt-6.1-sol",
+            "max_tokens": 128,
+            "messages": [{"role": "user", "content": "question"}]
+        });
+        if !thinking.is_null() {
+            payload["thinking"] = thinking;
+        }
+        if let Some(output) = output_config {
+            payload["output_config"] = output;
+        }
+        let request = serde_json::from_value::<MessagesRequest>(payload).unwrap();
+        reasoning_config(&request, &config, "gpt-6.1-sol")
+    }
+
+    #[test]
+    fn thinking_budget_maps_to_effort_tiers() {
+        for (budget, expected) in [
+            (2048u32, "low"),
+            (4096, "medium"),
+            (16000, "high"),
+            (32000, "max"),
+        ] {
+            let reasoning = reasoning_for(
+                serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+                None,
+            )
+            .unwrap_or_else(|| panic!("budget {budget} must produce a reasoning block"));
+            assert_eq!(reasoning.effort, expected, "budget {budget}");
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_uses_balanced_effort() {
+        let reasoning = reasoning_for(serde_json::json!({"type": "adaptive"}), None)
+            .expect("adaptive thinking must produce a reasoning block");
+        assert_eq!(reasoning.effort, "high");
+    }
+
+    #[test]
+    fn explicit_output_config_effort_overrides_thinking_budget() {
+        let reasoning = reasoning_for(
+            serde_json::json!({"type": "enabled", "budget_tokens": 2048}),
+            Some(serde_json::json!({"effort": "xhigh"})),
+        )
+        .expect("explicit effort must win");
+        assert_eq!(reasoning.effort, "xhigh");
+    }
+
+    #[test]
+    fn disabled_thinking_pins_lowest_supported_effort_without_summary() {
+        // `none` is rejected by some GPT gateway backends (verified 400), so an
+        // explicitly disabled thinking block must resolve to `low`, not `none`.
+        let reasoning = reasoning_for(serde_json::json!({"type": "disabled"}), None)
+            .expect("disabled thinking must still pin an effort");
+        assert_eq!(reasoning.effort, "low");
+        assert_eq!(reasoning.summary, None, "no summary → no thinking blocks");
+    }
+
+    #[test]
+    fn absent_thinking_keeps_legacy_wire_shape() {
+        assert!(
+            reasoning_for(Value::Null, None).is_none(),
+            "no thinking block must not invent a reasoning object"
+        );
+    }
+
+    #[test]
+    fn gpt_effort_resolution_never_emits_none() {
+        use crate::reasoning::apply_effort::resolve_effort;
+        let config = gpt_effort_config();
+        let provider = config.provider_config("gpt").unwrap();
+        assert_eq!(resolve_effort("none", provider), "low");
+        assert_eq!(resolve_effort("off", provider), "low");
+        assert_eq!(
+            resolve_effort("minimal", provider),
+            "low",
+            "minimal is also rejected upstream"
         );
     }
 }

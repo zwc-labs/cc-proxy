@@ -102,6 +102,12 @@ fn render_chat_messages(
                         // compression (P1-3). Append-only (Phase 4c): stored
                         // history is preserved byte-for-byte — no dedup, no
                         // compaction, order/tool IDs/content bytes intact.
+                        //
+                        // The OpenAI `tool` role carries text only, so images
+                        // inside a tool result are hoisted into a follow-up
+                        // user message after the tool messages.
+                        let mut tool_result_images: Vec<&crate::anthropic::types::ImageSource> =
+                            Vec::new();
                         for block in blocks {
                             if let ContentBlock::ToolResult {
                                 tool_use_id,
@@ -109,6 +115,19 @@ fn render_chat_messages(
                                 is_error,
                             } = block
                             {
+                                if let crate::anthropic::types::ToolResultContent::Blocks(inner) =
+                                    tool_content
+                                {
+                                    for result_block in inner {
+                                        if let crate::anthropic::types::ToolResultContentBlock::Image {
+                                            source,
+                                        } = result_block
+                                        {
+                                            tool_result_images.push(source);
+                                        }
+                                    }
+                                }
+
                                 let text = tool_result_to_text(tool_content);
 
                                 let wire_content = if append_only {
@@ -137,6 +156,21 @@ fn render_chat_messages(
                                     "content": content,
                                 }));
                             }
+                        }
+                        if !tool_result_images.is_empty() {
+                            let mut parts = vec![json!({
+                                "type": "text",
+                                "text": "[image returned by the tool result above]",
+                            })];
+                            for source in tool_result_images {
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{};base64,{}", source.media_type, source.data),
+                                    },
+                                }));
+                            }
+                            result.push(json!({"role": "user", "content": parts}));
                         }
                         continue;
                     }

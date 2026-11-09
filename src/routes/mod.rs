@@ -11,7 +11,7 @@ pub fn create_router(
     Router::new()
         .merge(messages::routes(client, official_client, config.clone()))
         .merge(models::routes(config.clone()))
-        .merge(health::routes())
+        .merge(health::routes(config.clone()))
 }
 
 pub mod health;

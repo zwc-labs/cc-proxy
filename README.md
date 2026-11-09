@@ -66,23 +66,62 @@ RUST_LOG=info \
 |----------|--------|-------------|
 | `/v1/messages` | POST | Anthropic Messages API (with streaming via `stream: true`) |
 | `/v1/models` | GET | Model list |
-| `/health` | GET | Health check |
+| `/health` | GET | Health check; also reports the effective config summary and model-resolution counters |
 
 ## Model Mapping
 
-| Claude Code Model | DeepSeek Model |
-|-------------------|---------------|
+Production routing lives in `~/.config/cc-proxy/config.toml` (selected by
+`MODEL_CONFIG_PATH`). The table below is only the built-in fallback used when
+no config file is present.
+
+| Claude Code Model | Built-in default upstream |
+|-------------------|---------------------------|
 | `claude-opus-4-7` | `deepseek-v4-pro` |
 | `claude-sonnet-4-6` | `deepseek-v4-flash` |
-| `claude-haiku-4-5` | `qwen3.6-inner-free` |
+| `claude-haiku-4-5` | `deepseek-v4-flash` |
 
-## Thinking Budget → Reasoning Effort
+### Resolution order
 
-| `budget_tokens` | `reasoning_effort` |
-|----------------|-------------------|
-| ≥ 4096 | `max` |
-| < 4096 (or adaptive) | `high` |
-| disabled | `off` |
+1. profile / alias pass-through, after stripping the `[1m]` context marker;
+2. exact `[models.mapping]` key;
+3. mapping key after stripping a structural suffix (`-YYYYMMDD`, `-latest`,
+   Bedrock-style `-vN:M`), so dated ids such as
+   `claude-sonnet-4-5-20250929` resolve instead of silently degrading;
+4. `[models].default`, counted as a fallback and warned once per inbound name.
+
+`GET /health` reports the effective config plus `model_resolution` counters
+(`profile_hits`, `mapping_hits`, `normalized_hits`, `fallbacks`) and the
+offending inbound names. Startup also fails fast when a mapping target does not
+resolve to a model profile.
+
+## Thinking Mode → Reasoning Effort
+
+### Chat wire (`/v1/chat/completions`)
+
+| Input | `reasoning_effort` |
+|-------|--------------------|
+| `output_config.effort` present | resolved through the provider's `effort_map` |
+| absent | legacy `xhigh` → `max` |
+
+### Responses wire (`/v1/responses`)
+
+Effort precedence: `output_config.effort` > thinking budget > legacy `max`.
+
+| Thinking mode | `reasoning.effort` |
+|---|---|
+| `budget_tokens` < 4096 | `low` |
+| 4096–9999 | `medium` |
+| 10000–19999 | `high` |
+| ≥ 20000 / `max` | `max` |
+| `adaptive` / budget 0 | `high` |
+| `disabled` | provider's lowest supported level, **no summary** |
+| no `thinking` block | field omitted (legacy shape) |
+
+GPT-family note: the gateway accepts `low / medium / high / xhigh / max` for
+`gpt-6.1-sol`; **`none` and `minimal` are rejected by some backends (HTTP 400)**,
+so `disabled` resolves to `low` instead of `none`. `xhigh` is aliased to `max`
+in `[providers.gpt.effort_map]`: Claude Code's top effort level means "the
+highest tier", which upstream is `max` (`ultra` is not a valid enum value).
 
 ## Credits
 

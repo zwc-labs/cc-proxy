@@ -1,4 +1,4 @@
-use crate::anthropic::converter::convert_request;
+use crate::anthropic::converter::convert_request_with_model;
 use crate::anthropic::types::MessagesRequest;
 use crate::client::DeepSeekClient;
 use crate::config::Config;
@@ -112,7 +112,11 @@ async fn handle_messages(
     let upstream_client = select_client(&upstream_model, &config, &client, &official_client);
     if config.wire_api_for_model(&upstream_model) == WireApi::Responses {
         let cache_policy = cache_policy_for(&config, &upstream_model);
-        let responses_req = match crate::responses::convert_request(&req, &config) {
+        let responses_req = match crate::responses::convert_request_with_model(
+            &req,
+            &config,
+            &upstream_model,
+        ) {
             Ok(request) => request,
             Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"type":"error","error":{"type":"invalid_request_error","message":e.to_string()}}))).into_response(),
         };
@@ -140,7 +144,7 @@ async fn handle_messages(
     }
 
     // Convert request
-    let openai_req = match convert_request(&req, &config) {
+    let openai_req = match convert_request_with_model(&req, &config, &upstream_model) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!("Request conversion error: {}", e);

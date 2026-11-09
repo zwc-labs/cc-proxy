@@ -37,20 +37,21 @@ pub(crate) fn inbound_effort(req: &MessagesRequest) -> Option<String> {
     }
 }
 
+/// Map Claude model names to upstream model names using the config's
+/// model_mapping and model_profiles.
+///
+/// Resolution (profile pass-through → exact mapping → suffix-normalized
+/// mapping → default) and the fallback counters live in
+/// [`crate::model_resolution`]; this wrapper keeps the historical signature.
 fn map_model_to_upstream(model: &str, config: &Config) -> String {
-    let clean = model.trim_end_matches("[1m]").trim();
-    // Check if it's already a known upstream model (profile or alias) — pass through
-    if config.model_profile(clean).is_some() {
-        return clean.to_string();
-    }
-    config
-        .model_mapping
-        .get(clean)
-        .cloned()
-        .unwrap_or_else(|| config.default_model.clone())
+    crate::model_resolution::resolve_model(model, config).upstream
 }
 
 /// Convert Anthropic MessagesRequest to OpenAI ChatCompletionRequest.
+///
+/// Test-only: the production route resolves the model once and calls
+/// [`convert_request_with_model`].
+#[cfg(test)]
 pub fn convert_request(
     req: &MessagesRequest,
     config: &Config,
@@ -59,20 +60,43 @@ pub fn convert_request(
     convert_request_with_relocation(req, config, relocate)
 }
 
+/// Same as [`convert_request`] with an already-resolved upstream model.
+///
+/// The messages route resolves the model once (to pick the wire API and the
+/// upstream client); passing the result here keeps that single resolution —
+/// and its `/health` counters — authoritative.
+pub fn convert_request_with_model(
+    req: &MessagesRequest,
+    config: &Config,
+    upstream_model: &str,
+) -> anyhow::Result<ChatCompletionRequest> {
+    let relocate = std::env::var("CODEMERMAFROST_RELOCATE").is_ok();
+    convert_request_with_relocation_and_model(req, config, relocate, upstream_model)
+}
+
 /// Same as [`convert_request`] with an explicit relocate decision.
 ///
 /// Zero behavior change: [`convert_request`] passes the process-level
 /// `CODEMERMAFROST_RELOCATE` flag here. Tests use this variant to capture and
 /// verify both relocate states deterministically (no process-global env races).
+#[cfg(test)]
 pub(crate) fn convert_request_with_relocation(
     req: &MessagesRequest,
     config: &Config,
     relocate: bool,
 ) -> anyhow::Result<ChatCompletionRequest> {
-    let model = req.model.clone();
     // Map Claude model names to upstream model names for eswitch
-    let upstream_model = map_model_to_upstream(&model, config);
-    let is_reasoning_model = requires_reasoning_content(&upstream_model, config);
+    let upstream_model = map_model_to_upstream(&req.model, config);
+    convert_request_with_relocation_and_model(req, config, relocate, &upstream_model)
+}
+
+pub(crate) fn convert_request_with_relocation_and_model(
+    req: &MessagesRequest,
+    config: &Config,
+    relocate: bool,
+    upstream_model: &str,
+) -> anyhow::Result<ChatCompletionRequest> {
+    let is_reasoning_model = requires_reasoning_content(upstream_model, config);
 
     // Determine effort level from thinking config for replay decision
     let effort_for_replay = req.thinking.as_ref().map(|t| {
@@ -88,7 +112,7 @@ pub(crate) fn convert_request_with_relocation(
         }
     });
     let include_reasoning = crate::reasoning::should_replay::should_replay_reasoning_content(
-        &upstream_model,
+        upstream_model,
         effort_for_replay,
         config,
     );
@@ -110,7 +134,7 @@ pub(crate) fn convert_request_with_relocation(
     // control (`thinking.type` / `reasoning_effort`, set later via
     // `apply_effort_direct`) is never changed or resurrected by it.
     let replay_full = config
-        .model_profile(&upstream_model)
+        .model_profile(upstream_model)
         .and_then(|p| {
             let binding = config.effective_upstream_binding(&p.provider);
             config
@@ -140,7 +164,7 @@ pub(crate) fn convert_request_with_relocation(
     // replay (`replay_full`, Phase 4b) and the current request's own output
     // control (`thinking.type` / `reasoning_effort`) are never touched by it.
     let append_only = config
-        .model_profile(&upstream_model)
+        .model_profile(upstream_model)
         .and_then(|p| {
             let binding = config.effective_upstream_binding(&p.provider);
             config
@@ -165,7 +189,7 @@ pub(crate) fn convert_request_with_relocation(
     // no official binding, non-Kimi providers — keeps the legacy env-driven
     // `CODEMERMAFROST_RELOCATE` path byte-for-byte (fail-closed).
     let split_tail = config
-        .model_profile(&upstream_model)
+        .model_profile(upstream_model)
         .and_then(|p| {
             let binding = config.effective_upstream_binding(&p.provider);
             config
@@ -233,7 +257,7 @@ pub(crate) fn convert_request_with_relocation(
     let stream = req.stream.unwrap_or(false);
 
     let mut openai_req = ChatCompletionRequest {
-        model: upstream_model,
+        model: upstream_model.to_string(),
         messages,
         max_tokens: None,
         max_completion_tokens: Some(req.max_tokens),
@@ -783,6 +807,36 @@ mod tests {
         let config = test_config();
         let req = MessagesRequest {
             model: "claude-opus-4".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            output_config: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn test_dated_model_id_normalizes_instead_of_falling_back() {
+        // Regression: Claude Code may send a dated id such as
+        // `claude-opus-4-20250101`; before normalization it missed the exact
+        // mapping key and silently degraded to the default model.
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "claude-opus-4-20250101".to_string(),
             system: None,
             messages: vec![Message {
                 role: "user".to_string(),

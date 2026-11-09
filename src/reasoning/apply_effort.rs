@@ -1,5 +1,28 @@
+use crate::anthropic::types::MessagesRequest;
 use crate::config::ProviderConfig;
 use serde_json::Value;
+
+/// Map Claude Code's thinking mode to a canonical effort tier.
+///
+/// Claude Code's `/think` levels raise `thinking.budget_tokens` (roughly the
+/// familiar 4k / 10k / 16k / 32k ladder). Before this mapping the Responses
+/// path ignored the budget entirely, so switching the thinking level had no
+/// effect on the upstream effort. `None`/adaptive budgets land on `high`
+/// (balanced), and an explicitly disabled thinking block maps to `none` so the
+/// caller can resolve it to the provider's lowest supported level.
+pub fn effort_from_thinking(req: &MessagesRequest) -> Option<&'static str> {
+    let thinking = req.thinking.as_ref()?;
+    if !thinking.is_enabled() {
+        return Some("none");
+    }
+    Some(match thinking.budget_tokens() {
+        None | Some(0) => "high",
+        Some(budget) if budget < 4096 => "low",
+        Some(budget) if budget < 10000 => "medium",
+        Some(budget) if budget < 20000 => "high",
+        Some(_) => "max",
+    })
+}
 
 /// Canonical effort tiers, ordered low → high.
 ///

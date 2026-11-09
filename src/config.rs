@@ -406,6 +406,33 @@ impl Config {
                 policy.validate_effort_enum(name, &provider.effort_map);
             }
         }
+
+        // 9. Every [models.mapping] target must resolve to a model profile
+        //    (name or alias). An unknown target would bypass the provider's
+        //    effort/thinking handling and fail upstream only at request time;
+        //    reject it at startup instead of degrading silently.
+        //    A mapping key that is itself a profile name/alias can never be
+        //    reached (profile pass-through wins) — warn, but do not fail.
+        for (inbound, upstream) in &self.model_mapping {
+            if !self.profile_by_name.contains_key(upstream) {
+                panic!(
+                    "Model mapping '{}' -> '{}' does not resolve to any model profile. \
+                     Available profiles: {:?}",
+                    inbound,
+                    upstream,
+                    self.model_profiles
+                        .iter()
+                        .map(|p| &p.name)
+                        .collect::<Vec<_>>()
+                );
+            }
+            if self.profile_by_name.contains_key(inbound) {
+                tracing::warn!(
+                    "[models.mapping] key '{}' is shadowed by a model profile name/alias and will never be used",
+                    inbound
+                );
+            }
+        }
     }
 
     /// Load model config from file with priority:
@@ -788,6 +815,88 @@ aliases = []
         };
         config.build_profile_index();
         config.validate(); // should panic
+    }
+
+    fn config_for_mapping_validation(
+        mapping: HashMap<String, String>,
+        profiles: Vec<ModelProfile>,
+    ) -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning_content".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: None,
+                thinking_type_enabled: None,
+                thinking_type_disabled: None,
+                disable_thinking: false,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+                responses_reasoning_summary: None,
+                cache_policy: None,
+            },
+        );
+
+        let mut config = Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
+            api_key: "test".to_string(),
+            log_level: "info".to_string(),
+            model_mapping: mapping,
+            default_model: "test-model".to_string(),
+            model_profiles: profiles,
+            providers,
+            profile_by_name: HashMap::new(),
+        };
+        config.build_profile_index();
+        config
+    }
+
+    #[test]
+    #[should_panic(expected = "does not resolve to any model profile")]
+    fn validate_rejects_mapping_target_outside_profiles() {
+        let mut mapping = HashMap::new();
+        mapping.insert("claude-opus-4".to_string(), "typo-model".to_string());
+        let config = config_for_mapping_validation(
+            mapping,
+            vec![ModelProfile {
+                name: "test-model".to_string(),
+                provider: "test".to_string(),
+                reasoning_enabled: false,
+                reasoning_replay: false,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
+            }],
+        );
+        config.validate(); // must panic: typo-model has no profile
+    }
+
+    #[test]
+    fn validate_accepts_mapping_to_profile_alias() {
+        let mut mapping = HashMap::new();
+        mapping.insert("claude-opus-4".to_string(), "test-alias".to_string());
+        let config = config_for_mapping_validation(
+            mapping,
+            vec![ModelProfile {
+                name: "test-model".to_string(),
+                provider: "test".to_string(),
+                reasoning_enabled: false,
+                reasoning_replay: false,
+                toolcall_requires_reasoning: false,
+                aliases: vec!["test-alias".to_string()],
+                wire_api: WireApi::ChatCompletions,
+            }],
+        );
+        config.validate(); // alias resolves: no panic
     }
 
     #[test]

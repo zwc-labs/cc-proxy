@@ -4,6 +4,7 @@ mod client;
 mod config;
 mod conversation;
 mod errors;
+mod model_resolution;
 mod openai;
 mod reasoning;
 mod responses;
